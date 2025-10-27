@@ -1,41 +1,28 @@
 import express from "express";
-import serverless from "serverless-http";
 import cors from "cors";
 import { ethers } from "ethers";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
-// Create express app
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Provider and contracts
+// Провайдер и контракт
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, [
+const abi = [
   "function balanceOf(address owner, uint256 tokenId) view returns (uint256)"
-], provider);
+];
+const contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, provider);
 
-// Interfaces
-const ERC721_IFACE = new ethers.Interface([
-  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
-  "function ownerOf(uint256 tokenId) view returns (address)"
-]);
-const ERC1155_IFACE = new ethers.Interface([
-  "event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)",
-  "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)"
-]);
-
-const erc721Contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, [
-  "function ownerOf(uint256 tokenId) view returns (address)"
-], provider);
-
+// Хранилище использованных txHash
 const usedTxs = new Set();
 
+// Проверка платежа через x402 фасилитатора
 async function x402CheckPayment(txHash, wallet, tokenId) {
   try {
-    const r = await fetch(process.env.X402_API, {
+    const resp = await fetch(`${process.env.X402_API}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -43,81 +30,108 @@ async function x402CheckPayment(txHash, wallet, tokenId) {
       },
       body: JSON.stringify({ txHash, wallet, tokenId })
     });
-    const data = await r.json();
+    const data = await resp.json();
     return data.success === true;
-  } catch (e) {
-    console.error("x402CheckPayment error:", e);
+  } catch (err) {
+    console.error("x402CheckPayment error:", err);
     return false;
   }
 }
 
-app.post("/verifyOwnership", async (req, res) => {
-  console.log("DEBUG request body:", req.body);
-
-  const { wallet, tokenId, txHash } = req.body || {};
-
-  if (!wallet || tokenId === undefined || !txHash) {
-    return res.status(400).json({
-      error: "Missing wallet, tokenId or txHash",
-      received: req.body
-    });
-  }
-
-  if (usedTxs.has(txHash)) {
-    return res.status(400).json({ error: "Tx already used" });
-  }
-
-  // x402
-  const paymentOk = await x402CheckPayment(txHash, wallet, tokenId);
-
-  // Balance check
-  let ownsNFT = false;
-  try {
-    const balance = await contract.balanceOf(wallet, tokenId);
-    ownsNFT = balance.toString() !== "0";
-  } catch (err) {}
-
-  let transferVerified = false;
-  const tx = await provider.getTransaction(txHash);
-
-  if (tx) {
-    const receipt = await provider.getTransactionReceipt(txHash);
-    if (receipt && receipt.logs) {
-      const addr = process.env.CONTRACT_ADDRESS.toLowerCase();
-      for (const log of receipt.logs) {
-        if (!log.address || log.address.toLowerCase() !== addr) continue;
-        try {
-          const p = ERC721_IFACE.parseLog(log);
-          if (p.name === "Transfer" &&
-              p.args[1].toLowerCase() === wallet.toLowerCase() &&
-              p.args[2].toString() === tokenId.toString()) {
-            transferVerified = true;
-            break;
-          }
-        } catch {}
-        try {
-          const p2 = ERC1155_IFACE.parseLog(log);
-          if (p2 && p2.name === "TransferSingle") {
-            if (p2.args[3].toLowerCase() === wallet.toLowerCase() &&
-                p2.args[4].toString() === tokenId.toString() &&
-                p2.args[5].toString() !== "0") {
-              transferVerified = true;
-              break;
+// Формирование валидного X402Response
+function makeResourceDescription(baseUrl, wallet, verified = false) {
+  return {
+    x402Version: 1,
+    payer: wallet,
+    accepts: [
+      {
+        scheme: "exact",
+        network: "base",
+        maxAmountRequired: "2",
+        resource: `${baseUrl}/verifyOwnership`,
+        description: "Verify ownership of GENGE NFT or payment transaction",
+        mimeType: "application/json",
+        payTo: process.env.PAY_TO,
+        maxTimeoutSeconds: 10,
+        asset: "USDC",
+        outputSchema: {
+          input: {
+            type: "http",
+            method: "POST",
+            bodyType: "json",
+            bodyFields: {
+              wallet: { type: "string", required: ["wallet"], description: "Wallet address" },
+              tokenId: { type: "number", required: ["tokenId"], description: "NFT tokenId" },
+              txHash: { type: "string", required: ["txHash"], description: "Transaction hash" }
             }
+          },
+          output: {
+            success: { type: "boolean" },
+            wallet: { type: "string" },
+            tokenId: { type: "number" },
+            verified: { type: "boolean" },
+            message: { type: "string" }
           }
-        } catch {}
+        },
+        extra: {
+          provider: "GENGE",
+          category: "Verification",
+          homepage: baseUrl
+        }
       }
+    ]
+  };
+}
+
+// Endpoint проверки владения NFT и оплаты
+app.post("/verifyOwnership", async (req, res) => {
+  try {
+    const { wallet, tokenId, txHash } = req.body;
+    if (!wallet || tokenId === undefined || !txHash) {
+      return res.status(400).json({ error: "Missing wallet, tokenId or txHash" });
     }
-  }
 
-  const verified = paymentOk || ownsNFT || transferVerified;
-  if (!verified) {
-    return res.status(402).json({ verified, paymentOk, ownsNFT, transferVerified });
-  }
+    // Проверка, что txHash ещё не использован
+    if (usedTxs.has(txHash)) {
+      return res.status(400).json({ error: "Transaction already used" });
+    }
 
-  usedTxs.add(txHash);
-  return res.json({ verified: true, wallet, tokenId });
+    // Проверка через x402 фасилитатор
+    const paymentOk = await x402CheckPayment(txHash, wallet, tokenId);
+
+    // Проверка владения NFT через контракт
+    const balance = await contract.balanceOf(wallet, tokenId);
+    const ownsNFT = balance > 0;
+
+    const verified = paymentOk || ownsNFT;
+
+    if (!verified) {
+      return res.status(402).json({ error: "Payment required or invalid" });
+    }
+
+    // Логируем транзакцию
+    usedTxs.add(txHash);
+
+    // Формируем X402Response
+    const response = makeResourceDescription(
+      "https://genge-api.vercel.app",
+      wallet,
+      verified
+    );
+
+    // Вставляем результат в output
+    response.accepts[0].outputSchema.output.wallet = wallet;
+    response.accepts[0].outputSchema.output.tokenId = tokenId;
+    response.accepts[0].outputSchema.output.verified = true;
+    response.accepts[0].outputSchema.output.message = "Ownership verified";
+
+    res.status(200).json(response);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
-// VERCEL EXPORT
-export default serverless(app);
+app.listen(process.env.PORT, () => {
+  console.log(`GENGE API running on port ${process.env.PORT}`);
+});
