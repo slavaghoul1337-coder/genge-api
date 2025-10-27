@@ -7,21 +7,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use((req, res, next) => {
-  let raw = '';
-  req.on('data', chunk => { raw += chunk; });
-  req.on('end', () => {
-    console.log('--- RAW REQUEST START ---');
-    console.log('method:', req.method);
-    console.log('url:', req.url);
-    console.log('headers:', JSON.stringify(req.headers, null, 2));
-    console.log('rawBody (first 2000 chars):', raw.slice(0, 2000));
-    console.log('--- RAW REQUEST END ---');
-    // положим сырое тело в req.rawBody для диагностики (не переопределяем req.body)
-    req.rawBody = raw;
-    next();
-  });
-});
+
 app.use(express.json());
 
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
