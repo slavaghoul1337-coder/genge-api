@@ -87,15 +87,15 @@ async function x402CheckPayment(txHash, wallet, tokenId) {
 }
 
 // RESOURCE_DESCRIPTION — строго типизированный для x402scan (GET должен отдавать 402)
-function makeResourceDescription(baseUrl) {
+function makeResourceDescription(baseUrl, wallet) {
   return {
     x402Version: 1,
-    payer: "0x0000000000000000000000000000000000000000",
+    payer: wallet,
     accepts: [
       {
         scheme: "exact",
         network: "base",
-        maxAmountRequired: "2", // строка
+        maxAmountRequired: "2",
         resource: `${baseUrl}/verifyOwnership`,
         description: "Verify ownership of GENGE NFT or payment transaction",
         mimeType: "application/json",
@@ -115,6 +115,9 @@ function makeResourceDescription(baseUrl) {
           },
           output: {
             success: { type: "boolean" },
+            wallet: { type: "string" },
+            tokenId: { type: "number" },
+            verified: { type: "boolean" },
             message: { type: "string" }
           }
         },
