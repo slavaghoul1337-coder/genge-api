@@ -28,6 +28,7 @@ const erc721Contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, [
   "function ownerOf(uint256 tokenId) view returns (address)"
 ], provider);
 
+// In-memory set for used txs (replace with Redis/DB in prod)
 const usedTxs = new Set();
 
 async function x402CheckPayment(txHash, wallet, tokenId) {
@@ -94,17 +95,33 @@ function makeResourceDescription(baseUrl, wallet, verified = false) {
 
 app.post("/verifyOwnership", async (req, res) => {
   try {
+    // Top-level debug: request body + presence of key env vars (no secrets)
+    console.log("DEBUG request body:", JSON.stringify(req.body).slice(0,2000));
+    console.log("DEBUG env keys present:", {
+      RPC_URL: !!process.env.RPC_URL,
+      CONTRACT_ADDRESS: !!process.env.CONTRACT_ADDRESS,
+      PAY_TO: !!process.env.PAY_TO,
+      X402_API: !!process.env.X402_API,
+      X402_API_KEY: !!process.env.X402_API_KEY,
+      PORT: !!process.env.PORT,
+    });
+
     const { wallet, tokenId, txHash } = req.body;
     if (!wallet || tokenId === undefined || !txHash) {
-      return res.status(400).json({ error: "Missing wallet, tokenId or txHash" });
+      return res.status(400).json({
+        error: "Missing wallet, tokenId or txHash",
+        receivedBody: req.body
+      });
     }
 
     if (usedTxs.has(txHash)) {
-      return res.status(400).json({ error: "Transaction already used" });
+      return res.status(400).json({ error: "Transaction already used", txHash });
     }
 
+    // 1) Optional check with x402 façade
     const paymentOk = await x402CheckPayment(txHash, wallet, tokenId);
 
+    // 2) balanceOf (ERC-1155 style) check
     let ownsNFT = false;
     try {
       const balance = await contract.balanceOf(wallet, tokenId);
@@ -114,14 +131,28 @@ app.post("/verifyOwnership", async (req, res) => {
       ownsNFT = false;
     }
 
+    // 3) Parse tx/receipt/logs — most reliable confirmation path
     let transferVerified = false;
+    let txTo = null;
     try {
       const tx = await provider.getTransaction(txHash);
       if (!tx) {
         console.warn("Transaction not found on RPC for hash:", txHash);
       } else {
+        // debug tx basic
+        console.log("DEBUG tx:", { hash: tx.hash, from: tx.from, to: tx.to, dataHead: tx.data?.slice?.(0,200) });
+
+        txTo = tx.to ? tx.to.toLowerCase() : null;
+        const payTo = process.env.PAY_TO ? process.env.PAY_TO.toLowerCase() : null;
+        const contractAddrLower = process.env.CONTRACT_ADDRESS ? process.env.CONTRACT_ADDRESS.toLowerCase() : null;
+
+        // Tolerant behavior: don't fail immediately if tx.to differs — many mints use factories/relayers.
+        if (txTo && payTo && txTo !== payTo && contractAddrLower && txTo !== contractAddrLower) {
+          console.warn(`tx.to (${txTo}) != PAY_TO (${payTo}) and != CONTRACT_ADDRESS (${contractAddrLower}). Continuing with logs/ownerOf checks.`);
+        }
+
         if (tx.from && tx.from.toLowerCase() !== wallet.toLowerCase()) {
-          console.warn(`tx.from (${tx.from}) != wallet (${wallet})`);
+          console.warn(`tx.from (${tx.from}) != wallet (${wallet}) — possible relayer/factory flow.`);
         }
 
         const receipt = await provider.getTransactionReceipt(txHash);
@@ -130,11 +161,13 @@ app.post("/verifyOwnership", async (req, res) => {
         } else if (receipt.status && receipt.status !== 1) {
           console.warn("Transaction failed (status != 1)", receipt.status);
         } else {
-          const contractAddrLower = process.env.CONTRACT_ADDRESS.toLowerCase();
+          // scan logs from our contract address
           for (const log of receipt.logs) {
             if (!log.address) continue;
-            if (log.address.toLowerCase() !== contractAddrLower) continue; // только логи от нашего контракта
+            if (!contractAddrLower) continue;
+            if (log.address.toLowerCase() !== contractAddrLower) continue;
 
+            // try ERC-721 Transfer
             try {
               const parsed = ERC721_IFACE.parseLog(log);
               if (parsed && parsed.name === "Transfer") {
@@ -147,8 +180,10 @@ app.post("/verifyOwnership", async (req, res) => {
                 }
               }
             } catch (e) {
+              // not an ERC-721 log — ignore
             }
 
+            // try ERC-1155 TransferSingle / TransferBatch
             try {
               const parsed1155 = ERC1155_IFACE.parseLog(log);
               if (parsed1155) {
@@ -174,9 +209,11 @@ app.post("/verifyOwnership", async (req, res) => {
                 }
               }
             } catch (e) {
+              // not an ERC-1155 log — ignore
             }
           }
 
+          // Final fallback: ownerOf for ERC-721
           if (!transferVerified) {
             try {
               const owner = await erc721Contract.ownerOf(tokenId);
@@ -184,6 +221,7 @@ app.post("/verifyOwnership", async (req, res) => {
                 transferVerified = true;
               }
             } catch (e) {
+              // ownerOf may throw if token doesn't exist — ignore
             }
           }
         }
@@ -195,13 +233,17 @@ app.post("/verifyOwnership", async (req, res) => {
     const verified = paymentOk || ownsNFT || transferVerified;
 
     if (!verified) {
-      return res.status(402).json({ error: "Payment required or invalid", details: { paymentOk, ownsNFT, transferVerified } });
+      return res.status(402).json({
+        error: "Payment required or invalid",
+        details: { paymentOk, ownsNFT, transferVerified, txTo, expected: { payTo: process.env.PAY_TO, contractAddress: process.env.CONTRACT_ADDRESS } }
+      });
     }
 
+    // mark tx as used
     usedTxs.add(txHash);
 
     const response = makeResourceDescription(
-      "https://genge-api.vercel.app",
+      process.env.BASE_URL || "https://genge-api.vercel.app",
       wallet,
       verified
     );
@@ -211,10 +253,10 @@ app.post("/verifyOwnership", async (req, res) => {
     response.accepts[0].outputSchema.output.verified = true;
     response.accepts[0].outputSchema.output.message = "Ownership or payment verified";
 
-    res.status(200).json(response);
+    return res.status(200).json(response);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: "Server error", message: err?.message });
   }
 });
 
